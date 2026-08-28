@@ -712,7 +712,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 // MARK: - App delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    var controllers: [BrowserWindowController] = []
+    private var browserWindowControllers: [BrowserWindowController] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -724,7 +724,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if let s = UserDefaults.standard.string(forKey: "LastURL") { return URL(string: s) }
             return nil
         }()
-        openWindow(url: url, size: launchOptions.size, snap: launchOptions.snap, isPrimary: true)
+        if browserWindowControllers.isEmpty {
+            openBrowserWindow(url: url, size: launchOptions.size, snapshotJob: launchOptions.snap)
+        }
         NSApp.activate(ignoringOtherApps: true)
 
         if launchOptions.snap != nil {
@@ -735,23 +737,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func openWindow(url: URL?, size: NSSize? = nil, snap: SnapJob? = nil, isPrimary: Bool = false) {
-        let controller = BrowserWindowController(url: url, size: size, snap: snap, isPrimary: isPrimary)
+    private func openBrowserWindow(url: URL?, size: NSSize? = nil, snapshotJob: SnapJob? = nil) {
+        let controller = BrowserWindowController(
+            url: url,
+            size: size,
+            snap: snapshotJob,
+            isPrimary: browserWindowControllers.isEmpty)
         controller.onClose = { [weak self, weak controller] in
-            self?.controllers.removeAll { $0 === controller }
+            self?.browserWindowControllers.removeAll { $0 === controller }
         }
-        controllers.append(controller)
+        browserWindowControllers.append(controller)
         controller.showWindow(nil)
         controller.window?.makeKeyAndOrderFront(nil)
     }
 
-    @objc func newWindow(_ sender: Any?) { openWindow(url: nil) }
+    @objc private func newBrowserWindow(_ sender: Any?) { openBrowserWindow(url: nil) }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
 
     func application(_ application: NSApplication, open urls: [URL]) {
-        for url in urls { openWindow(url: url) }
+        for url in urls { openBrowserWindow(url: url) }
     }
 
     // MARK: Menu
@@ -773,7 +779,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         main.addItem(withTitle: "Chromeless", action: nil, keyEquivalent: "").submenu = appMenu
 
         let fileMenu = NSMenu(title: "File")
-        let newWin = fileMenu.addItem(withTitle: "New Window", action: #selector(newWindow(_:)), keyEquivalent: "n")
+        let newWin = fileMenu.addItem(
+            withTitle: "New Window", action: #selector(newBrowserWindow(_:)), keyEquivalent: "n")
         newWin.target = self
         fileMenu.addItem(withTitle: "Open Location…",
                          action: #selector(BrowserWindowController.openLocation(_:)), keyEquivalent: "l")
