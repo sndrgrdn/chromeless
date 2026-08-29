@@ -5,6 +5,7 @@ cd "${0:a:h}"
 
 APP="Chromeless.app"
 ARCH="$(uname -m)"
+MACOS_VERSION="26.0"
 
 if [[ ! -f Chromeless.icns ]]; then
   echo "▸ rendering icon"
@@ -17,13 +18,13 @@ fi
 echo "▸ compiling ($ARCH)"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 swiftc -O -swift-version 5 \
-  -target "$ARCH-apple-macos13.0" \
+  -target "$ARCH-apple-macos$MACOS_VERSION" \
   main.swift \
   -o "$APP/Contents/MacOS/Chromeless" \
   -framework Cocoa -framework WebKit
 
 cp Chromeless.icns "$APP/Contents/Resources/Chromeless.icns"
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -37,7 +38,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleVersion</key><string>1</string>
   <key>CFBundleIconFile</key><string>Chromeless</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>LSMinimumSystemVersion</key><string>$MACOS_VERSION</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
