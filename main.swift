@@ -114,6 +114,211 @@ func parseLaunchOptions() -> LaunchOptions {
 
 let launchOptions = parseLaunchOptions()
 
+// MARK: - Web extensions
+
+private enum ExtensionError: LocalizedError {
+    case cancelled
+    case missing
+
+    var errorDescription: String? {
+        switch self {
+        case .cancelled: return "Installation was cancelled."
+        case .missing: return "The installed web extension is missing."
+        }
+    }
+}
+
+private extension WKWebExtension {
+    var preferredDisplayName: String? {
+        displayName ?? displayShortName
+    }
+}
+
+private func confirmDialog(_ messageText: String, _ informativeText: String, accept: String) -> Bool {
+    let alert = NSAlert()
+    alert.messageText = messageText
+    alert.informativeText = informativeText
+    alert.alertStyle = .warning
+    alert.addButton(withTitle: accept)
+    alert.addButton(withTitle: "Cancel")
+    return alert.runModal() == .alertFirstButtonReturn
+}
+
+final class ExternalExtensionManager: NSObject, WKWebExtensionControllerDelegate {
+    private static let installedExtensionPathKey = "InstalledWebExtensionPath"
+    private static let extensionIdentifier = "com.chromeless.external-extension"
+    private static let controllerIdentifier = UUID(uuidString: "B0A77C23-CF51-4E42-85D8-D28C82B81A30")!
+
+    let webExtensionController: WKWebExtensionController
+    private let baseWebViewConfiguration: WKWebViewConfiguration
+    private var installedContext: WKWebExtensionContext?
+    var browserWindows: () -> [BrowserWindowController] = { [] }
+
+    var installedExtensionName: String? {
+        installedContext?.webExtension.preferredDisplayName
+    }
+
+    override init() {
+        let controllerConfiguration = WKWebExtensionController.Configuration(
+            identifier: Self.controllerIdentifier)
+        controllerConfiguration.webViewConfiguration = WKWebViewConfiguration()
+        controllerConfiguration.defaultWebsiteDataStore = .default()
+
+        webExtensionController = WKWebExtensionController(configuration: controllerConfiguration)
+        let browserConfiguration = webExtensionController.configuration.webViewConfiguration!
+        browserConfiguration.webExtensionController = webExtensionController
+        baseWebViewConfiguration = browserConfiguration
+        super.init()
+        webExtensionController.delegate = self
+    }
+
+    func makeBrowserWebViewConfiguration() -> WKWebViewConfiguration {
+        baseWebViewConfiguration.copy() as! WKWebViewConfiguration
+    }
+
+    func loadInstalledExtension() async throws {
+        guard let path = UserDefaults.standard.string(forKey: Self.installedExtensionPathKey) else { return }
+        let url = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            UserDefaults.standard.removeObject(forKey: Self.installedExtensionPathKey)
+            throw ExtensionError.missing
+        }
+        try await loadExtension(at: url)
+    }
+
+    func installExtension(from sourceURL: URL) async throws -> String {
+        let candidate = try await WKWebExtension(resourceBaseURL: sourceURL)
+        guard confirmExtensionInstall(candidate) else {
+            throw ExtensionError.cancelled
+        }
+
+        let extensionsDirectory = try makeExtensionsDirectory()
+        let destination = extensionsDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension(sourceURL.pathExtension)
+        try FileManager.default.copyItem(at: sourceURL, to: destination)
+
+        let oldPath = UserDefaults.standard.string(forKey: Self.installedExtensionPathKey)
+        do {
+            try await loadExtension(at: destination)
+            UserDefaults.standard.set(destination.path, forKey: Self.installedExtensionPathKey)
+            removeManagedExtension(atPath: oldPath)
+        } catch {
+            try? FileManager.default.removeItem(at: destination)
+            throw error
+        }
+
+        browserWindows().forEach { $0.webView.reload() }
+        return installedExtensionName ?? candidate.preferredDisplayName ?? "Web Extension"
+    }
+
+    func removeInstalledExtension() throws {
+        if let context = installedContext {
+            try webExtensionController.unload(context)
+            installedContext = nil
+        }
+        let oldPath = UserDefaults.standard.string(forKey: Self.installedExtensionPathKey)
+        UserDefaults.standard.removeObject(forKey: Self.installedExtensionPathKey)
+        removeManagedExtension(atPath: oldPath)
+        browserWindows().forEach { $0.webView.reload() }
+    }
+
+    private func loadExtension(at url: URL) async throws {
+        let extensionPackage = try await WKWebExtension(resourceBaseURL: url)
+        let context = WKWebExtensionContext(for: extensionPackage)
+        context.uniqueIdentifier = Self.extensionIdentifier
+        context.baseURL = URL(string: "webkit-extension://\(Self.extensionIdentifier)/")!
+        context.isInspectable = true
+
+        for permission in extensionPackage.requestedPermissions {
+            context.setPermissionStatus(.grantedExplicitly, for: permission)
+        }
+        for pattern in extensionPackage.requestedPermissionMatchPatterns {
+            context.setPermissionStatus(.grantedExplicitly, for: pattern)
+        }
+
+        let previousContext = installedContext
+        if let previousContext { try webExtensionController.unload(previousContext) }
+        do {
+            try webExtensionController.load(context)
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                context.loadBackgroundContent { error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume()
+                    }
+                }
+            }
+            installedContext = context
+        } catch {
+            if let previousContext {
+                try? webExtensionController.load(previousContext)
+                installedContext = previousContext
+            }
+            throw error
+        }
+    }
+
+    private func confirmExtensionInstall(_ extensionPackage: WKWebExtension) -> Bool {
+        let access = extensionPackage.allRequestedMatchPatterns.contains { $0.matchesAllHosts }
+            ? "It can read and change data on all websites."
+            : "It can read and change data on matching websites."
+        return confirmDialog(
+            "Install \(extensionPackage.preferredDisplayName ?? "this extension")?",
+            access + " Only install extensions that you trust.",
+            accept: "Install")
+    }
+
+    private func makeExtensionsDirectory() throws -> URL {
+        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Chromeless", isDirectory: true)
+            .appendingPathComponent("Extensions", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return root
+    }
+
+    private func removeManagedExtension(atPath path: String?) {
+        guard let path,
+              let managedRoot = try? makeExtensionsDirectory() else { return }
+        let url = URL(fileURLWithPath: path)
+        guard url.path.hasPrefix(managedRoot.path) else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    func webExtensionController(_ controller: WKWebExtensionController,
+                                openWindowsFor context: WKWebExtensionContext) -> [any WKWebExtensionWindow] {
+        browserWindows()
+    }
+
+    func webExtensionController(_ controller: WKWebExtensionController,
+                                focusedWindowFor context: WKWebExtensionContext) -> (any WKWebExtensionWindow)? {
+        browserWindows().first { $0.window?.isKeyWindow == true }
+    }
+
+    func webExtensionController(_ controller: WKWebExtensionController,
+                                promptForPermissions permissions: Set<WKWebExtension.Permission>,
+                                in tab: (any WKWebExtensionTab)?, for context: WKWebExtensionContext,
+                                completionHandler: @escaping (Set<WKWebExtension.Permission>, Date?) -> Void) {
+        completionHandler(confirmRuntimePermission(for: context) ? permissions : [], nil)
+    }
+
+    func webExtensionController(_ controller: WKWebExtensionController,
+                                promptForPermissionMatchPatterns patterns: Set<WKWebExtension.MatchPattern>,
+                                in tab: (any WKWebExtensionTab)?, for context: WKWebExtensionContext,
+                                completionHandler: @escaping (Set<WKWebExtension.MatchPattern>, Date?) -> Void) {
+        completionHandler(confirmRuntimePermission(for: context) ? patterns : [], nil)
+    }
+
+    private func confirmRuntimePermission(for context: WKWebExtensionContext) -> Bool {
+        let name = context.webExtension.preferredDisplayName ?? "The extension"
+        return confirmDialog(
+            "Allow additional extension access?",
+            "\(name) requested additional access to browser data or websites.",
+            accept: "Allow")
+    }
+}
+
 // MARK: - Start page
 
 let startPageHTML = """
@@ -198,7 +403,8 @@ final class LayoutReportingView: NSView {
 // MARK: - Browser window
 
 final class BrowserWindowController: NSWindowController, NSWindowDelegate,
-    WKNavigationDelegate, WKUIDelegate, NSTextFieldDelegate, NSMenuItemValidation {
+    WKNavigationDelegate, WKUIDelegate, WKWebExtensionTab, WKWebExtensionWindow,
+    NSTextFieldDelegate, NSMenuItemValidation {
 
     let webView: BrowserWebView
     private let progressBar = NSView()
@@ -212,10 +418,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     private var toastHide: DispatchWorkItem?
     private var lastProgress: CGFloat = 0
     private var onStartPage = false
+    private let webExtensionController: WKWebExtensionController
     var onClose: (() -> Void)?
 
-    init(url: URL?, size: NSSize?, snap: SnapJob?, isPrimary: Bool) {
-        let conf = WKWebViewConfiguration()
+    init(url: URL?, size: NSSize?, snap: SnapJob?, isPrimary: Bool,
+         configuration: WKWebViewConfiguration) {
+        let conf = configuration
         conf.preferences.isElementFullscreenEnabled = true
         conf.mediaTypesRequiringUserActionForPlayback = []
         conf.allowsAirPlayForMediaPlayback = true
@@ -236,6 +444,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
                 forMainFrameOnly: false)
             conf.userContentController.addUserScript(hideWebAuthn)
         }
+        webExtensionController = conf.webExtensionController!
         webView = BrowserWebView(frame: .zero, configuration: conf)
         snapJob = snap
 
@@ -288,11 +497,13 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         if let size { window.setContentSize(size) }
 
         installMouseMonitor()
-
-        if let url { navigate(to: url) } else { loadStartPage() }
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
+
+    func loadInitialPage(_ url: URL?) {
+        if let url { navigate(to: url) } else { loadStartPage() }
+    }
 
     // MARK: Chrome (what little there is)
 
@@ -596,10 +807,18 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         }
     }
 
+    // MARK: Web extension tab and window
+
+    func webView(for context: WKWebExtensionContext) -> WKWebView? { webView }
+    func window(for context: WKWebExtensionContext) -> (any WKWebExtensionWindow)? { self }
+    func tabs(for context: WKWebExtensionContext) -> [any WKWebExtensionTab] { [self] }
+    func activeTab(for context: WKWebExtensionContext) -> (any WKWebExtensionTab)? { self }
+
     // MARK: NSWindowDelegate
 
     func windowDidEnterFullScreen(_ notification: Notification) { setTrafficLights(visible: true) }
     func windowDidExitFullScreen(_ notification: Notification) { setTrafficLights(visible: false) }
+    func windowDidBecomeKey(_ notification: Notification) { webExtensionController.didFocusWindow(self) }
 
     func windowWillClose(_ notification: Notification) {
         if let monitor = mouseMonitor { NSEvent.removeMonitor(monitor) }
@@ -711,13 +930,31 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
 // MARK: - App delegate
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var browserWindowControllers: [BrowserWindowController] = []
+    private let extensionManager = ExternalExtensionManager()
+
+    override init() {
+        super.init()
+        extensionManager.browserWindows = { [weak self] in self?.browserWindowControllers ?? [] }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         buildMenu()
+        // Open the first window immediately; extension loading must not gate it
+        // (a missing or slow extension would otherwise leave the app windowless).
+        finishApplicationLaunch()
+        Task {
+            do {
+                try await extensionManager.loadInstalledExtension()
+            } catch {
+                showExtensionError("Couldn’t load the installed extension", error)
+            }
+        }
+    }
 
+    private func finishApplicationLaunch() {
         let url: URL? = {
             if let u = launchOptions.url { return u }
             if launchOptions.snap != nil { return nil }
@@ -742,16 +979,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             url: url,
             size: size,
             snap: snapshotJob,
-            isPrimary: browserWindowControllers.isEmpty)
+            isPrimary: browserWindowControllers.isEmpty,
+            configuration: extensionManager.makeBrowserWebViewConfiguration())
         controller.onClose = { [weak self, weak controller] in
-            self?.browserWindowControllers.removeAll { $0 === controller }
+            guard let self, let controller else { return }
+            self.extensionManager.webExtensionController.didCloseTab(controller, windowIsClosing: true)
+            self.extensionManager.webExtensionController.didCloseWindow(controller)
+            self.browserWindowControllers.removeAll { $0 === controller }
         }
         browserWindowControllers.append(controller)
+        extensionManager.webExtensionController.didOpenWindow(controller)
+        extensionManager.webExtensionController.didOpenTab(controller)
+        extensionManager.webExtensionController.didActivateTab(controller, previousActiveTab: nil)
         controller.showWindow(nil)
         controller.window?.makeKeyAndOrderFront(nil)
+        controller.loadInitialPage(url)
     }
 
     @objc private func newBrowserWindow(_ sender: Any?) { openBrowserWindow(url: nil) }
+
+    @objc private func installWebExtension(_ sender: Any?) {
+        let panel = NSOpenPanel()
+        panel.title = "Install Web Extension"
+        panel.prompt = "Choose"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.zip, .folder]
+        guard panel.runModal() == .OK, let sourceURL = panel.url else { return }
+
+        Task {
+            do {
+                let name = try await extensionManager.installExtension(from: sourceURL)
+                showExtensionMessage("Installed \(name)", "The extension is active in all Chromeless windows.")
+            } catch ExtensionError.cancelled {
+                return
+            } catch {
+                showExtensionError("Couldn’t install the web extension", error)
+            }
+        }
+    }
+
+    @objc private func removeWebExtension(_ sender: Any?) {
+        guard let name = extensionManager.installedExtensionName else { return }
+        guard confirmDialog("Remove \(name)?", "The extension will stop running in Chromeless.", accept: "Remove") else { return }
+        do {
+            try extensionManager.removeInstalledExtension()
+        } catch {
+            showExtensionError("Couldn’t remove the web extension", error)
+        }
+    }
+
+    private func showExtensionMessage(_ title: String, _ detail: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = detail
+        alert.runModal()
+    }
+
+    private func showExtensionError(_ title: String, _ error: Error) {
+        let alert = NSAlert(error: error)
+        alert.messageText = title
+        alert.runModal()
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(removeWebExtension(_:)) {
+            if let name = extensionManager.installedExtensionName {
+                menuItem.title = "Remove \(name)…"
+                return true
+            }
+            menuItem.title = "Remove Web Extension…"
+            return false
+        }
+        return true
+    }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
@@ -831,6 +1133,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         historyMenu.addItem(withTitle: "Forward",
                             action: #selector(BrowserWindowController.goForwardAction(_:)), keyEquivalent: "]")
         main.addItem(withTitle: "History", action: nil, keyEquivalent: "").submenu = historyMenu
+
+        let extensionsMenu = NSMenu(title: "Extensions")
+        let installExtension = extensionsMenu.addItem(
+            withTitle: "Install Web Extension…", action: #selector(installWebExtension(_:)), keyEquivalent: "")
+        installExtension.target = self
+        let removeExtension = extensionsMenu.addItem(
+            withTitle: "Remove Web Extension…", action: #selector(removeWebExtension(_:)), keyEquivalent: "")
+        removeExtension.target = self
+        main.addItem(withTitle: "Extensions", action: nil, keyEquivalent: "").submenu = extensionsMenu
 
         let windowMenu = NSMenu(title: "Window")
         windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")

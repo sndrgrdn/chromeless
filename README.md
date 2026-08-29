@@ -13,7 +13,7 @@ A native macOS app in one Swift file, built on WKWebView (the Safari engine). No
 open Chromeless.app
 ```
 
-Requires the Xcode Command Line Tools (`xcode-select --install`). Optionally `mv Chromeless.app /Applications/`.
+Requires macOS 26 and the Xcode Command Line Tools (`xcode-select --install`). Optionally `mv Chromeless.app /Applications/`.
 
 ## Use
 
@@ -34,6 +34,12 @@ Everything is a keystroke (also listed on the start page and in the menu bar):
 | `⌘N` / `⌘W` | New window / close window |
 
 The traffic-light buttons exist but stay invisible — hover the top-left corner to reveal them. The window remembers its frame and reopens your last page.
+
+## Web extensions
+
+Use **Extensions → Install Web Extension…** to install one WebExtension ZIP or unpacked directory. Chromeless copies the selected extension into its Application Support directory, asks before granting website access, and loads it in every window. Use **Extensions → Remove…** to uninstall it.
+
+For ad blocking, download the official uBlock Origin Lite Safari ZIP from its GitHub releases. The extension package is not bundled with Chromeless and updates are manual.
 
 ## CLI screenshot mode
 
@@ -65,7 +71,7 @@ Apple gates WebAuthn in WKWebView behind the restricted `com.apple.developer.web
   The same binary detects the entitlement and stops hiding WebAuthn. macOS may show a one-time consent (System Settings → Privacy & Security lists passkey access for web browsers).
 - Presents a Safari user agent; element fullscreen, autoplay, and AirPlay are enabled.
 - First `⇧⌘S` may trigger the standard macOS prompt to allow Desktop access.
-- Deliberately absent: tabs, find-in-page, downloads, history UI, extensions. That's the point.
+- Deliberately absent: tabs, find-in-page, downloads, and history UI. That's the point.
 
 ## License
 
